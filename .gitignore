@@ -1,0 +1,22 @@
+# 运行时产物
+__pycache__/
+*.pyc
+log.txt
+params.json
+.cache/
+
+# 本地开发笔记（含本机环境信息，不公开）
+AGENTS.md
+TTT.txt
+
+# 历史方案，不进仓库（键盘注入版 / AHK 版 / 按键精灵版）
+sf6_random.pyw
+sf6_random.ahk
+启动.cmd
+调试启动.cmd
+启动-AHK版.cmd
+ahk/
+*.Q
+
+# 第三方二进制，请从官方发布页自行下载
+tools/*.exe
