@@ -18,10 +18,9 @@
 
 下载并安装 ViGEmBus（微软签名驱动，一路"下一步"，装完建议重启一次电脑）：
 
-- **省事做法**：直接下本项目的 Releases 附件 `ViGEmBus_1.22.0_x64_x86_arm64.exe`
-  （就是官方原版安装包，未做任何修改，许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)）
 - 官方发布页：<https://github.com/nefarius/ViGEmBus/releases>
 - 本项目在 1.22.0 上验证通过（该版本是最终版，**不含会外联的更新器组件**）
+- 第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
 **第二步（一次性）：装 Python 库**
 
