@@ -18,6 +18,8 @@
 
 下载并安装 ViGEmBus（微软签名驱动，一路"下一步"，装完建议重启一次电脑）：
 
+- **省事做法**：直接下本项目的 Releases 附件 `ViGEmBus_1.22.0_x64_x86_arm64.exe`
+  （就是官方原版安装包，未做任何修改，许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)）
 - 官方发布页：<https://github.com/nefarius/ViGEmBus/releases>
 - 本项目在 1.22.0 上验证通过（该版本是最终版，**不含会外联的更新器组件**）
 
@@ -105,7 +107,7 @@ py sf6_gamepad.pyw --selftest :: 只自检，不建窗口
 
 代码以 MIT 许可发布，见 `LICENSE`。
 
-第三方组件：`vgamepad`（MIT）、ViGEmBus 驱动（BSD-3-Clause，作者已归档但驱动仍有效）。
-本项目不附带上述软件的安装包，请从各自的官方发布页获取。
+第三方组件（ViGEmBus 驱动 BSD-3-Clause、vgamepad MIT）的声明见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 《街头霸王6》为卡普空（CAPCOM）的商标与版权作品，本项目与其无关，仅供个人单机娱乐。
