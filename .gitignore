@@ -4,6 +4,7 @@ __pycache__/
 log.txt
 params.json
 .cache/
+.workbuddy/
 
 # 本地开发笔记（含本机环境信息，不公开）
 AGENTS.md
