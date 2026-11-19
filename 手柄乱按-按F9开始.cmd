@@ -2,7 +2,7 @@
 setlocal
 rem SF6 Random Keys - mini controller (gamepad edition)
 rem Double-click: opens a small window in STANDBY. It does NOT start by itself.
-rem   F9 = start random input   /   F10 = stop   /   F8 = taunt
+rem   F9 = start (F7 same, backup)   /   F10 = stop   /   F8 = taunt
 rem   (all of them work while you are in the game, no need to alt-tab)
 rem   Close the small window to quit and release the virtual pad.
 rem

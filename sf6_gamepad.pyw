@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""街霸6 随机按键玩具 —— 虚拟手柄版 v0.9（需要 ViGEmBus + vgamepad）
+"""街霸6 随机按键玩具 —— 虚拟手柄版 v1.1（需要 ViGEmBus + vgamepad）
 
 原理：借助 ViGEmBus 创建一台"虚拟 Xbox 手柄"（内核级虚拟设备，系统与
 游戏都把它当作真实手柄），脚本直接随机按手柄按钮来玩街霸6。
@@ -8,11 +8,15 @@
 
 两种用法：
   1) 双击「手柄乱按-按F9开始.cmd」——双击后先待命（不自动开始），
-     进游戏按 F9 才开始 / F10 停止；迷你窗口只看状态。
-  2) 双击「启动-手柄版.cmd」——带参数面板的完整版（同样支持 F9/F10）。
+     进游戏按 F9 开始，F10 停止；迷你窗口只看状态。
+  2) 双击「启动-手柄版.cmd」——带参数面板的完整版（同样支持热键）。
 参数（面板里改、改完立即生效，并自动记住到 params.json）：
   每组持续帧数 / 空拍概率
-热键：F9 = 开始乱按 / F10 = 停止 / F8 = 嘲讽（六个拳脚键同时按一下，不进随机池）
+热键（游戏里直接按，不用切出来）：
+  F9 = 开始乱按（F7 同功能，F9 被占时用）
+  F10 = 停止
+  F8  = 嘲讽（六个拳脚键同时按一下，不进随机池）
+  —— 三条监听通道并行（键盘钩子 / 系统热键 / 轮询），任何一条活着就能用。
 
 命令行参数：
   --auto      启动即开始乱按（配合「一键乱按.cmd」）
@@ -30,6 +34,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import queue
 import random
 import sys
 import threading
@@ -37,7 +42,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_TITLE = "街霸6 随机按键玩具（手柄版）v0.9"
+APP_TITLE = "街霸6 随机按键玩具（手柄版）v1.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(APP_DIR, "log.txt")
 PARAM_PATH = os.path.join(APP_DIR, "params.json")   # 面板参数存档（调一次就记住）
@@ -163,16 +168,59 @@ def is_game_foreground():
     return TARGET_TITLE_SUBSTR in title.lower()
 
 
-# ------------------------------------------------------------------ 全局热键（轮询式：零驱动、零钩子、不需要管理员）
-# 用 GetAsyncKeyState 而不是键盘钩子：钩子需要额外的权限/可能被安全软件拦；
-# 轮询只要界面事件循环还活着就行。低 1 位 = "上次查询之后被按过"，所以
-# 即使快速点一下也不会漏。
+# ------------------------------------------------------------------ 全局热键
+# v1.0：**三条通道并行**，任一条活着热键就能用（以前只有第 ③ 条，在游戏里失灵的
+# 概率就全压在它身上）：
+#   ① 低级键盘钩子 WH_KEYBOARD_LL —— 系统在把按键发给任何窗口之前先调我们，
+#      全屏/游戏独占键盘时也照收；不需要管理员（除非前台是提权进程）
+#   ② RegisterHotKey 系统热键 —— 进程级注册，和焦点无关
+#   ③ GetAsyncKeyState 轮询 —— 兜底（前两条被安全软件拦掉时还能用）
+# 三条会同时收到同一次按下 → 按"动作"做 200ms 去重，保证一次按键只切一次。
+VK_F7 = 0x76       # 开始乱按（备用键：F9 被别的软件占住时用）
 VK_F8 = 0x77       # 嘲讽（六个拳脚键同时按一下）
-VK_F9 = 0x78       # 开始乱按
-VK_F10 = 0x79      # 停止乱按
+VK_F9 = 0x78       # 开始乱按（主用键）
+VK_F10 = 0x79      # 强制停止
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+WM_HOTKEY = 0x0312
+MOD_NOREPEAT = 0x4000
+LLKHF_INJECTED = 0x10
+HOTKEY_ID_BASE = 0x5F60
+# 跨通道去重窗口：钩子几乎立刻收到，轮询最晚 120ms 后才看到同一次按下 -> 180ms 够用。
+# 只按"键"去重（F7 和 F9 互不影响），真实人手两次按键远慢于 180ms。
+HOTKEY_DEDUPE_SEC = 0.18
+
+_HIT_QUEUE = queue.Queue()      # (vk, 来源) —— 钩子回调里只做入队，绝不干重活
+_LAST_HIT = {}                  # vk -> 上次触发时间（跨通道去重）
+_HELD = set()                   # 钩子通道：当前按着没松开的键（挡掉键盘自动重复）
+_LISTENER_INFO = []             # 启动结果（写进日志）
+_HOOK_PROC = None               # 必须留引用，否则回调被 GC 后钩子直接失效
+_TIDS = {}                      # 监听线程 id（退出时 PostThreadMessage 用）
+
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
-_HOTKEY_PREV = {}
+
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                     wt.HINSTANCE, wt.DWORD]
+user32.SetWindowsHookExW.restype = ctypes.c_void_p
+user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                  wt.WPARAM, wt.LPARAM]
+user32.CallNextHookEx.restype = ctypes.c_ssize_t
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+user32.UnhookWindowsHookEx.restype = wt.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.GetMessageW.restype = wt.BOOL
+user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+user32.RegisterHotKey.restype = wt.BOOL
+user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wt.BOOL
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.PostThreadMessageW.restype = wt.BOOL
+kernel32.GetCurrentThreadId.restype = wt.DWORD
+
+_PREV_KEY = {}
 
 
 def hotkey_hit(vk):
@@ -187,9 +235,156 @@ def hotkey_hit(vk):
     except Exception:
         return False
     down = bool(state & 0x8000)
-    prev = _HOTKEY_PREV.get(vk, 0)
-    _HOTKEY_PREV[vk] = 1 if down else 0
+    prev = _PREV_KEY.get(vk, 0)
+    _PREV_KEY[vk] = 1 if down else 0
     return (bool(state & 0x0001) or down) and not prev
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+# ---- 动作（任何通道触发都走这里；都只碰共享状态，不碰 tk）
+def _act_start(source):
+    """F9/F7：开始乱按。**只开始，不切换** —— 战斗中不用记"现在是开还是关"。"""
+    with S.lock:
+        was = S.running
+        S.running = True
+    if was:
+        _log_line("热键 开始（%s）—— 本来就在跑，忽略" % source)
+        return
+    _log_line("热键 开始（%s）" % source)
+    _set_status("乱按中…", "run")
+
+
+def _act_stop(source):
+    """F10：停止（再按 F9 才继续）。"""
+    with S.lock:
+        was = S.running
+        S.running = False
+    if was:
+        _log_line("热键 停止（%s）" % source)
+    _set_status("已停止 —— 按 F9 开始", "idle")
+
+
+def _act_taunt(source):
+    with S.lock:
+        S.taunt_req = True
+    _log_line("热键 嘲讽（%s）" % source)
+
+
+# 键 -> 动作（F7 是 F9 的备用键：F9 被别的软件占住时用）
+_ACTIONS = {VK_F9: _act_start,
+            VK_F7: _act_start,
+            VK_F10: _act_stop,
+            VK_F8: _act_taunt}
+
+
+def handle_vk(vk, source):
+    """所有通道的按键都汇总到这里：先按"键"做跨通道去重，再执行动作。"""
+    fn = _ACTIONS.get(vk)
+    if fn is None:
+        return
+    now = time.monotonic()
+    if now - _LAST_HIT.get(vk, 0.0) < HOTKEY_DEDUPE_SEC:
+        return                      # 同一次按下被另一条通道重复上报
+    _LAST_HIT[vk] = now
+    fn(source)
+
+
+def poll_hotkeys():
+    """兜底通道：轮询 F9/F7/F10/F8（由界面定时器调用）。"""
+    for vk in (VK_F9, VK_F7, VK_F10, VK_F8):
+        if hotkey_hit(vk):
+            _HIT_QUEUE.put((vk, "轮询"))
+
+
+def _hit_dispatcher():
+    """把各通道上报的按键串行化，保证动作不在钩子回调里执行（钩子要立刻返回）。"""
+    while not QUIT.is_set():
+        try:
+            vk, source = _HIT_QUEUE.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        try:
+            handle_vk(vk, source)
+        except Exception:
+            _log_exc()
+
+
+def _kb_hook_proc(nCode, wParam, lParam):
+    try:
+        if nCode == 0:
+            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            vk = int(kb.vkCode)
+            if vk in _ACTIONS and not (kb.flags & LLKHF_INJECTED):
+                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    if vk not in _HELD:      # 按住不放的自动重复在这里挡掉
+                        _HELD.add(vk)
+                        _HIT_QUEUE.put((vk, "键盘钩子"))
+                elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                    _HELD.discard(vk)
+    except Exception:
+        pass
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _kb_hook_thread():
+    global _HOOK_PROC
+    _TIDS["hook"] = kernel32.GetCurrentThreadId()
+    try:
+        _HOOK_PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                        wt.WPARAM, wt.LPARAM)(_kb_hook_proc)
+        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL,
+                                        ctypes.cast(_HOOK_PROC, ctypes.c_void_p),
+                                        None, 0)
+    except Exception as e:
+        _LISTENER_INFO.append("键盘钩子 FAIL(%s)" % e)
+        return
+    if not hook:
+        _LISTENER_INFO.append("键盘钩子 FAIL(err=%d)" % ctypes.get_last_error())
+        return
+    _LISTENER_INFO.append("键盘钩子 OK")
+    msg = wt.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        pass                        # 只为让钩子回调有消息泵，不处理内容
+    user32.UnhookWindowsHookEx(hook)
+
+
+def _hotkey_msg_thread():
+    """RegisterHotKey 通道：线程内注册 + 自己泵消息（WM_HOTKEY 投递到本线程队列）。"""
+    _TIDS["hotkey"] = kernel32.GetCurrentThreadId()
+    ids = {}
+    for i, vk in enumerate((VK_F9, VK_F7, VK_F10, VK_F8)):
+        hid = HOTKEY_ID_BASE + i
+        if user32.RegisterHotKey(None, hid, MOD_NOREPEAT, vk):
+            ids[hid] = vk
+    _LISTENER_INFO.append("系统热键 %d/4 注册成功" % len(ids))
+    msg = wt.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        if msg.message == WM_HOTKEY:
+            vk = ids.get(int(msg.wParam))
+            if vk is not None:
+                _HIT_QUEUE.put((vk, "系统热键"))
+    for hid in ids:
+        user32.UnregisterHotKey(None, hid)
+
+
+def start_hotkey_listeners():
+    """启动三条通道（都在守护线程里，不阻塞界面）。"""
+    for target, name in ((_hit_dispatcher, "hk-dispatch"),
+                         (_kb_hook_thread, "hk-hook"),
+                         (_hotkey_msg_thread, "hk-register")):
+        threading.Thread(target=target, daemon=True, name=name).start()
+
+
+def stop_hotkey_listeners():
+    for name, tid in list(_TIDS.items()):
+        try:
+            user32.PostThreadMessageW(tid, 0x0012, 0, 0)      # WM_QUIT
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ 日志
@@ -468,13 +663,13 @@ class App:
         btns = ttk.Frame(wrap)
         btns.pack(fill="x", pady=(0, 10))
         self.start_btn = tk.Button(
-            btns, text="▶ 开始乱按", font=FONT_UI, width=13,
+            btns, text="▶ 开始乱按 (F9)", font=FONT_UI, width=16,
             bg="#2e7d32", fg="#ffffff", activebackground="#1b5e20",
             activeforeground="#ffffff", relief="flat", cursor="hand2",
             command=self.on_start)
         self.start_btn.pack(side="left")
         self.stop_btn = tk.Button(
-            btns, text="■ 停止", font=FONT_UI, width=9,
+            btns, text="■ 停止 (F10)", font=FONT_UI, width=11,
             bg="#ececec", relief="flat", cursor="hand2", command=self.on_stop)
         self.stop_btn.pack(side="left", padx=(8, 0))
         self.taunt_btn = tk.Button(
@@ -512,13 +707,14 @@ class App:
                       row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         if MINI:
-            tips_text = ("F9 = 开始乱按   /   F10 = 停止   /   F8 = 嘲讽\n"
-                         "（在游戏里直接按，不用切出来）\n"
+            tips_text = ("F9 = 开始乱按（F7 也行）      F10 = 停止      F8 = 嘲讽\n"
+                         "不想乱按时按 F10，想继续再按 F9\n"
                          "只对街霸6窗口生效；切出游戏自动暂停\n"
                          "仅限单机 / 训练模式娱乐，请勿在在线模式使用")
         else:
             tips_text = ("通过「虚拟 Xbox 手柄」发送按键，游戏无法过滤\n"
-                         "F8 = 嘲讽（六键同按） / F9 = 开始乱按 / F10 = 停止（游戏里也有效）\n"
+                         "F9 = 开始乱按（F7 也行） / F10 = 停止 / F8 = 嘲讽\n"
+                         "热键三条通道并行（键盘钩子 / 系统热键 / 轮询），游戏里直接按即可\n"
                          "只对街霸6窗口生效；切出游戏自动暂停（切回来继续）\n"
                          "参数改完立即生效，并自动记住（下次打开还是这套）\n"
                          "仅限单机 / 训练模式娱乐，请勿在在线模式使用")
@@ -563,16 +759,9 @@ class App:
             S.taunt_req = True
 
     def poll(self):
-        # 全局热键：F8 嘲讽 / F9 开始 / F10 停止（在游戏里也有效，不必切出来点按钮）
-        if hotkey_hit(VK_F8):
-            _log_line("热键 F8：嘲讽（六键同按）")
-            self.on_taunt()
-        if hotkey_hit(VK_F9):
-            _log_line("热键 F9：开始乱按")
-            self.on_start()
-        if hotkey_hit(VK_F10):
-            _log_line("热键 F10：停止")
-            self.on_stop()
+        # 兜底通道：轮询 F9/F7/F10/F8（键盘钩子/系统热键正常时它们已先处理，
+        # 这里重复上报的会被 200ms 去重吃掉）——面板按钮/热键都会在下一拍反映出来。
+        poll_hotkeys()
         with S.lock:
             status, level, latest, running = (S.status, S.status_level,
                                               S.latest_key, S.running)
@@ -581,7 +770,8 @@ class App:
         self.status_lbl.config(text="● " + status, fg=colors.get(level, "#9e9e9e"))
         self.key_lbl.config(text="最近按钮：" +
                             ("—" if latest == "-" else latest))
-        self.start_btn.config(state=("disabled" if running else "normal"),
+        self.start_btn.config(text="▶ 开始乱按 (F9)",
+                              state=("disabled" if running else "normal"),
                               bg=("#9e9e9e" if running else "#2e7d32"))
         self.stop_btn.config(state=("normal" if running else "disabled"))
         self.root.after(120, self.poll)
@@ -691,13 +881,17 @@ def main():
 
     _log_line("启动（手柄版，pid=%d）" % os.getpid())
     threading.Thread(target=worker, daemon=True, name="pad-worker").start()
+    start_hotkey_listeners()                    # 键盘钩子 + 系统热键 + 轮询兜底
 
     root = tk.Tk()
     app = App(root)
+    root.after(350, lambda: _log_line(
+        "热键监听：" + (" / ".join(_LISTENER_INFO) or "(无报告)")))
     if AUTO_START:
         app.on_start()
         _log_line("自动开始乱按（--auto）")
     root.mainloop()
+    stop_hotkey_listeners()
     QUIT.set()
     time.sleep(0.15)
     release_all_once()          # 退出前松开所有键（防卡键）

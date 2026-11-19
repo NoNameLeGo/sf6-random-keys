@@ -2,7 +2,7 @@
 setlocal
 rem SF6 Random Keys - virtual gamepad edition launcher (full panel)
 rem Opens the full control panel (start/stop buttons + parameters).
-rem   F9 = start   /   F10 = stop   /   F8 = taunt
+rem   F9 = start (F7 same)  /  F10 = stop  /  F8 = taunt
 rem
 rem Interpreter picking: prefer the known-good Python, and require BOTH tkinter
 rem and the vgamepad PACKAGE. find_spec() only checks that the package is
